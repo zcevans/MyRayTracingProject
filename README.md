@@ -1,2 +1,2 @@
 # MyRayTracingProject
-My RayTracing Project
+https://ccrma.stanford.edu/~azaday/cs248/fp/
