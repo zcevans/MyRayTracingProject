@@ -1,0 +1,545 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture2D<float4> Result;
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+
+// skybox
+Texture2D<float4> _SkyboxTexture;
+SamplerState sampler_SkyboxTexture;
+int _SkyboxEnabled = 1;
+static const float PI = 3.14159265f;
+
+// random jitter for anti-aliasing
+float2 _PixelOffset;
+int _MaxReflections;
+
+// lighting 
+float4 _DirectionalLight;
+
+/*========== Utility ============*/
+static const float EPSILON = 1e-8;
+
+float sdot(float3 x, float3 y, float f = 1.0f) {
+    return saturate(dot(x, y) * f);
+}
+
+float3x3 GetTangentSpace(float3 normal)
+{
+    // Choose a helper vector for the cross product
+    float3 helper = float3(1, 0, 0);
+    if (abs(normal.x) > 0.99f)
+        helper = float3(0, 0, 1);
+    // Generate vectors
+    float3 tangent = normalize(cross(normal, helper));
+    float3 binormal = normalize(cross(normal, tangent));
+    return float3x3(tangent, binormal, normal);
+}
+
+float energy(float3 color)
+{
+    return dot(color, 1.0f / 3.0f);
+}
+/*==========RNG============*/
+float2 pixel;
+
+// uint rng_state;
+float _Seed;
+
+float rand()
+{
+    float result = frac(sin(_Seed / 100.0f * dot(pixel, float2(12.9898f, 78.233f))) * 43758.5453f);
+    _Seed += 1.0f;
+    return result;
+}
+
+//  ref: https://www.shadertoy.com/view/4djSRW
+
+float hash12(float2 p)
+{
+	float3 p3  = frac(float3(p.xyx) * .1031f);
+    p3 += dot(p3, p3.yzx + 33.33f);
+    return frac((p3.x + p3.y) * p3.z);
+}
+
+// ref: http://corysimon.github.io/articles/uniformdistn-on-sphere/
+float3 SampleHemisphere(float3 normal)
+{
+    // Uniformly sample hemisphere direction
+    float cosTheta = rand();
+    float sinTheta = sqrt(max(0.0f, 1.0f - cosTheta * cosTheta));
+    float phi = 2 * PI * rand();
+    float3 tangentSpaceDir = float3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+    // Transform direction to world space
+    return mul(tangentSpaceDir, GetTangentSpace(normal));
+}
+
+/*=============Supported Object Geometries================*/
+struct Sphere {
+    float3 center;
+    float radius;
+    float3 albedo;
+    float3 specular;
+    float3 emission;
+};
+
+
+// scene objects
+float3 _GroundAlbedo;
+float3 _GroundSpecular;
+float3 _GroundEmission;
+StructuredBuffer<Sphere> _Spheres;
+const int _NumSpheres;
+
+// Triangle meshes
+StructuredBuffer<float3> _Vertices;
+StructuredBuffer<float3> _Normals;
+StructuredBuffer<int> _Indices;
+StructuredBuffer<int> _MatIndices;
+const int _NumIndices;
+
+struct TriMeshMaterial {
+    float3 albedo, specular, emission;
+};
+StructuredBuffer<TriMeshMaterial> _TriMeshMats;
+
+// BVH
+struct BVH_Node {
+    float3 bot, top; // BBox
+    int leftOrCount;  // if leaf, number of tri indices. Else index of left child
+    int rightOrOffset; // if leaf, offset into indices buffer. Else index of right child
+    int isLeaf;
+};
+StructuredBuffer<BVH_Node> _BVH_Nodes;
+static const uint MAX_BVH_DEPTH = 64; // max array size for doing depth-first traversal of BVH
+const int _BVHSize;
+
+// #define BRUTE_FORCE 1
+
+/*=======Ray=======*/
+struct Ray
+{
+    float3 origin;
+    float3 direction;
+    float3 energy;
+    float3 invDir;
+};
+
+Ray CreateRay(float3 origin, float3 direction)
+{
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    ray.energy = float3(1.0f, 1.0f, 1.0f);
+    ray.invDir = 1.0f / direction;
+    return ray;
+}
+
+Ray CreateCameraRay(float2 uv)
+{
+    // Transform the camera origin to world space
+        // retrieve the translation column (shearing in homo space)
+    float3 origin = mul(_CameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+    
+    // Invert the perspective projection of the view-space position
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+    // Transform the direction from camera to world space and normalize
+    direction = mul(_CameraToWorld, float4(direction, 0.0f)).xyz;
+    direction = normalize(direction);
+    return CreateRay(origin, direction);
+}
+
+/*********Ray Hit **************/
+struct RayHit
+{
+    float3 position;
+    float distance;
+    float3 normal;
+    float3 albedo;
+    float3 specular;
+    float3 emission;
+};
+RayHit CreateRayHit()
+{
+    RayHit hit;
+    hit.position = float3(0.0f, 0.0f, 0.0f);
+    hit.distance = 1.#INF;
+    hit.normal = float3(0.0f, 0.0f, 0.0f);
+    hit.albedo = float3(0.0f, 0.0f, 0.0f);
+    hit.specular = float3(0.0f, 0.0f, 0.0f);
+    hit.emission = float3(0.0f,0.0f,0.0f);
+    return hit;
+}
+
+/*=============Intersection Functions================*/
+// sphere defined as (x, y, z, radius)
+void IntersectSphere(Ray ray, inout RayHit bestHit, Sphere sphere)
+{
+    // ref: https://en.wikipedia.org/wiki/Line%E2%80%93sphere_intersection
+    float3 d = ray.origin - sphere.center;  // direction from ray origin to sphere
+    float b = dot(ray.direction, d);
+    float c = dot(d, d) - (sphere.radius * sphere.radius);
+
+    // evaluate quadratic determinant
+    float det_squared = (b*b) - c;
+    if (det_squared < 0)
+        return;  // no real solutions
+    float det = sqrt(det_squared);
+    float t = -b - det; 
+    if (t < 0)
+        t = -b + det;
+    if (t > 0 && t < bestHit.distance)
+    {
+        bestHit.distance = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal = normalize(bestHit.position - sphere.center);
+        bestHit.specular = sphere.specular;
+        bestHit.albedo = sphere.albedo;
+        bestHit.emission = sphere.emission;
+    }
+}
+
+// TODO: change to generic plane isection test
+void IntersectGroundPlane(Ray ray, inout RayHit bestHit)
+{
+    // Calculate distance along the ray where the ground plane is intersected
+    float t = -ray.origin.y / ray.direction.y;
+    if (t > 0 && t < bestHit.distance)
+    {
+        bestHit.distance = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal = float3(0.0f, 1.0f, 0.0f);
+
+        bestHit.albedo = _GroundAlbedo;
+        bestHit.specular = _GroundSpecular;
+        bestHit.emission = _GroundEmission;
+    }
+}
+
+struct Trisect {
+    float t;
+    float u;
+    float v;
+};
+
+Trisect CreateTrisect() {
+    Trisect T;
+    T.t = 1.#INF;
+    T.u = -1;
+    T.v = -1;
+    return T;
+}
+
+// Ref https://www.scratchapixel.com/lessons/3d-basic-rendering/ray-tracing-rendering-a-triangle
+// Möller-Trumbore algorithm
+bool Trisection(Ray ray, float3 v0, float3 v1, float3 v2,
+    inout Trisect T)
+{
+    float3 v0v1 = v1 - v0;
+    float3 v0v2 = v2 - v0;
+    
+    float3 pvec = cross(ray.direction, v0v2);
+    float det = dot(v0v1, pvec);
+    // culling
+    if (det < EPSILON)
+        return false;
+    float inv_det = 1.0f / det;
+
+    float3 tvec = ray.origin - v0;
+
+    // U
+    float u = dot(tvec, pvec) * inv_det;
+    if (u < 0.0 || u > 1.0f) return false;
+
+    // V
+    float3 qvec = cross(tvec, v0v1);
+    float v = dot(ray.direction, qvec) * inv_det;
+    if (v < 0.0 || u + v > 1.0f) return false;
+
+    // t
+    float t = dot(v0v2, qvec) * inv_det;
+    if (t > 0) {
+        T.t = t;
+        T.u = u;
+        T.v = v;
+        return true;
+    }
+    return false;
+}
+
+void IntersectAllTris(Ray ray, inout RayHit bestHit) {
+    for (int i = 0; i < _NumIndices; i += 3) {
+        float3
+            v0 = _Vertices[_Indices[i]],
+            v1 = _Vertices[_Indices[i+1]],
+            v2 = _Vertices[_Indices[i+2]],
+            n0 = _Normals[_Indices[i]],
+            n1 = _Normals[_Indices[i+1]],
+            n2 = _Normals[_Indices[i+2]];
+            
+
+        Trisect tri = CreateTrisect();
+        if (Trisection(ray, v0, v1, v2, tri)) {
+            if (tri.t > bestHit.distance)
+                continue;
+
+            bestHit.distance = tri.t;
+            bestHit.position = ray.origin + tri.t * ray.direction;
+
+            // TODO: use UV to interpolate normals
+            float w = 1 - tri.u - tri.v;
+            bestHit.normal = (tri.u*n1) + (tri.v * n2) + (w * n0);
+            
+            // get mesh mat
+            TriMeshMaterial triMat = _TriMeshMats[_MatIndices[i]];
+            bestHit.albedo = triMat.albedo;
+            bestHit.specular = triMat.specular;
+            bestHit.emission = triMat.emission;
+        }
+    }
+}
+
+// ref: https://www.scratchapixel.com/lessons/3d-basic-rendering/minimal-ray-tracer-rendering-simple-shapes/ray-box-intersection
+bool IntersectAABB(Ray r, float3 bot, float3 top, inout float2 t) {
+    float tmin, tmax, tymin, tymax, tzmin, tzmax, tmp;
+
+    tmin = (bot.x - r.origin.x) * r.invDir.x;
+    tmax = (top.x - r.origin.x) * r.invDir.x;
+    if (tmin > tmax) { // swap
+        tmp = tmin; tmin = tmax; tmax = tmp;
+    }
+    tymin = (bot.y - r.origin.y) * r.invDir.y;
+    tymax = (top.y - r.origin.y) * r.invDir.y;
+    if (tymin > tymax) { // swap
+        tmp = tymin; tymin = tymax; tymax = tmp;
+    }
+
+    if ((tmin > tymax) || (tymin > tmax))  // miss
+        return false;
+    tmin = max(tmin, tymin);
+    tmax = min(tmax, tymax);
+
+    tzmin = (bot.z - r.origin.z) * r.invDir.z;
+    tzmax = (top.z - r.origin.z) * r.invDir.z;
+    if (tzmin > tzmax) { // swap
+        tmp = tzmin; tzmin = tzmax; tzmax = tmp;
+    }
+
+    if ((tmin > tzmax) || (tzmin > tmax))  // miss
+        return false;
+    tmin = max(tmin, tzmin);
+    tmax = min(tmax, tzmax);
+
+    t = float2(tmin, tmax);
+    return true;
+}
+
+void IntersectBVH(Ray ray, inout RayHit bestHit) {
+    int nodeStack[MAX_BVH_DEPTH];  // stack for performing BVH Traversal
+    int stackTop = 0;
+
+    nodeStack[0] = 0; // place root node on stack
+    int counter = 0;
+
+    while (stackTop >= 0) {  // assume ray intersects bbox of curnode
+        if (counter++ > _BVHSize) return;
+        
+        BVH_Node node = _BVH_Nodes[nodeStack[stackTop--]]; // pop top node off stack
+
+        float2 bbox_ts = float2(1.#INF, 1.#INF);
+        bool isectBBox = IntersectAABB(ray, node.bot, node.top, bbox_ts);
+
+        if (!isectBBox || bbox_ts.x > bestHit.distance)
+            continue; // doesn't intersect current node, or hit is farther than closest. skip.
+
+        if (node.isLeaf == 1) { // leaf node
+            int indexCount = node.leftOrCount;
+            int indexOff = node.rightOrOffset;
+            for (int i = indexOff; i < (indexOff + indexCount); i += 3) {
+                if (i < 0 || i > _NumIndices - 3) {
+                    return;
+                }
+                float3
+                    v0 = _Vertices[_Indices[i]],
+                    v1 = _Vertices[_Indices[i+1]],
+                    v2 = _Vertices[_Indices[i+2]],
+                    n0 = _Normals[_Indices[i]],
+                    n1 = _Normals[_Indices[i+1]],
+                    n2 = _Normals[_Indices[i+2]];
+
+                Trisect tri = CreateTrisect();
+                if (Trisection(ray, v0, v1, v2, tri)) {
+                    if (tri.t > 0 && tri.t < bestHit.distance)
+                    {
+                        bestHit.distance = tri.t;
+                        bestHit.position = ray.origin + tri.t * ray.direction;
+
+                        // interpolate normals
+                        float w = 1 - tri.u - tri.v;
+                        bestHit.normal = (tri.u*n1) + (tri.v * n2) + (w * n0);
+
+                        // get mesh mat
+                        TriMeshMaterial triMat = _TriMeshMats[_MatIndices[i]];
+                        bestHit.albedo = triMat.albedo;
+                        bestHit.specular = triMat.specular;
+                        bestHit.emission = triMat.emission;
+                    }
+                }
+            }
+        } else { // inner node
+            if (stackTop + 1 >= MAX_BVH_DEPTH) return;
+            int leftIndex = node.leftOrCount;
+            int rightIndex = node.rightOrOffset;
+
+            // push nodes onto stack. traverse left branches first
+            nodeStack[++stackTop] = rightIndex; 
+            nodeStack[++stackTop] = leftIndex; 
+        }
+    }
+}
+
+
+RayHit Trace(Ray ray) // populate bestHit
+{
+    RayHit bestHit = CreateRayHit();
+    IntersectGroundPlane(ray, bestHit);
+
+    // loop over all spheres
+    for (int i = 0; i < _NumSpheres; i++)
+        IntersectSphere(ray, bestHit, _Spheres[i]);
+
+    #ifdef BRUTE_FORCE
+        IntersectAllTris(ray, bestHit);
+    #else
+        IntersectBVH(ray, bestHit);
+    #endif
+
+    
+    return bestHit;
+}
+
+float3 Shade(inout Ray ray, inout RayHit hit)
+{
+    if (hit.distance < 1.#INF)
+    {
+        // for gold:
+        // float3 specular = float3(1.0f, 0.78f, 0.34f); // surface absorbs green and blue light, leaving gold color
+            // for more physically-based values: https://blog.selfshadow.com/publications/s2015-shading-course/#course_content
+
+        // Reflect the ray and multiply energy with specular reflection
+            // offset along normal to prevent re-colliding at same spot
+        // ray.origin = hit.position + hit.normal * 0.001f; 
+
+        // // TODO: implement multipple hemisphere sampling here, rather than in addshader
+        // float3 reflected = reflect(ray.direction, hit.normal);
+        // ray.direction = SampleHemisphere(hit.normal);
+        
+        // // TODO: add phong reflectance specular exponent here?
+        // // ray.energy *= hit.specular;  // specular component
+        // // ray.energy *= 2 * hit.albedo * sdot(hit.normal, ray.direction);  // for ideal diffuse material
+        // // return 0.0f;  // diffuse materials do not emit light, 
+        //     // the light to be reflected off this surface is factored into ray.energy
+
+        // float3 diffuse = 2 * min(1.0f - hit.specular, hit.albedo);
+        // float alpha = 15.0f;
+        // float3 specular = hit.specular * (alpha + 2) * pow(sdot(ray.direction, reflected), alpha);
+        // ray.energy *= (diffuse + specular) * sdot(hit.normal, ray.direction);
+        // return 0.0f;
+
+        // // TODO: add ambient material lighting
+
+        // /* shadows */
+        // Ray shadowRay = CreateRay(hit.position + hit.normal * 0.001f, -1 * _DirectionalLight.xyz);
+        // RayHit shadowHit = Trace(shadowRay);
+        // if (shadowHit.distance != 1.#INF)
+        // {
+        //     // TODO: implement soft shadows / area lights
+        //     return float3(0.0f, 0.0f, 0.0f); // hard shadows for point light
+        // }
+
+        // // diffuse component
+        //     // TODO: can add normal mapping here
+        //     // TODO: add specular component here, or is this already captured in ray.energy?
+        // return saturate(-dot(hit.normal, _DirectionalLight.xyz)) * _DirectionalLight.w * hit.albedo;  
+
+        // Return the normal
+        // return hit.normal * 0.5f + 0.5f;
+
+        // Roulette shading copied from: http://three-eyed-games.com/2018/05/12/gpu-path-tracing-in-unity-part-2/
+        hit.albedo = min(1.0f - hit.specular, hit.albedo);
+        float specChance = energy(hit.specular);
+        float diffChance = energy(hit.albedo);
+        float sum = specChance + diffChance;
+        specChance /= sum;
+        diffChance /= sum;
+        // Roulette-select the ray's path
+        float roulette = rand();
+        if (roulette < specChance)
+        {
+            // Specular reflection
+            ray.origin = hit.position + hit.normal * 0.001f;
+            ray.direction = reflect(ray.direction, hit.normal);
+            ray.energy *= (1.0f / specChance) * hit.specular * sdot(hit.normal, ray.direction);
+        }
+        else
+        {
+            // Diffuse reflection
+            ray.origin = hit.position + hit.normal * 0.001f;
+            ray.direction = SampleHemisphere(hit.normal);
+            ray.energy *= (1.0f / diffChance) * 2 * hit.albedo * sdot(hit.normal, ray.direction);
+        }
+
+        return hit.emission;
+    }
+    else
+    {
+        // no hit, set energy to 0
+        ray.energy = float3(0.0f, 0.0f, 0.0f);
+        // darkness
+        if (_SkyboxEnabled == 0)
+            return float3(0, 0, 0);
+        // Sample the skybox and write it
+        float theta = acos(ray.direction.y) / -PI;
+        float phi = atan2(ray.direction.x, -ray.direction.z) / -PI * 0.5f;
+        return _SkyboxTexture.SampleLevel(sampler_SkyboxTexture, float2(phi, theta), 0).xyz;
+    }
+}
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    pixel = id.xy;
+
+    // Get the dimensions of the RenderTexture
+    uint width, height;
+    Result.GetDimensions(width, height);
+
+    // Transform pixel to [-1,1] range
+        // jittered ray sample, random(0-1, 0-1) _PixelOffset
+    float2 uv = float2((id.xy + _PixelOffset) / float2(width, height) * 2.0f - 1.0f);
+
+    int numTraces = 1;  // if camera is locked, can increase this?
+    float3 aggregateResult = float3(0.0f, 0.0f, 0.0f);
+
+    // Get a ray from the UVs
+    Ray ray = CreateCameraRay(uv);  
+
+    // Path Trace and shade
+    float3 result = float3(0, 0, 0);
+    for (int i = 0; i < _MaxReflections /* max num reflections */; i++)
+    {
+        // update ray invDir (for AABB test)
+        ray.invDir = 1.0f / ray.direction;
+        RayHit hit = Trace(ray);
+        // ORDER MATTERS! energy between hit point and origin.
+            // multiply energy at current ray path with light emitted at hit point
+        result += ray.energy * Shade(ray, hit);
+            // then update ray energy to account attenuation at hit point
+        if (!any(ray.energy))
+            break;
+    }
+    Result[id.xy] = float4(result, 1);
+}
